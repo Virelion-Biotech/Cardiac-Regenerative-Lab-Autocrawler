@@ -186,6 +186,14 @@ def _pick_first_nonempty(values: list[str]) -> str:
             return v
     return ""
 
+def _pick_first_truthy(values: list[Any]) -> Any:
+    """Like _pick_first_nonempty, but for non-string values (e.g. the
+    geo_coordinates dict) where '' isn't the right falsy sentinel to check."""
+    for v in values:
+        if v:
+            return v
+    return None
+
 def _union_lists(lists: list[list[str]]) -> list[str]:
     seen = []
     for lst in lists:
@@ -228,7 +236,10 @@ def merge_cluster(indices: list[int], candidates: list[dict[str, Any]]) -> dict[
         "institution": _pick_longest([m.get("institution", "") for m in members]),
         "city": _pick_first_nonempty([m.get("city", "") for m in members]),
         "country": _pick_first_nonempty([m.get("country", "") for m in members]),
-        "geo_coordinates": _pick_first_nonempty([str(m.get("geo_coordinates") or "") for m in members]) or None,
+        # geo_coordinates is a {"lat": float, "lng": float} dict (or None) from step 6's
+        # Nominatim lookup — pick the first member that actually has one rather than
+        # coercing to a string, so downstream consumers get real numeric coordinates.
+        "geo_coordinates": _pick_first_truthy([m.get("geo_coordinates") for m in members]),
         "research_focus": {
             "cell_gene_sources": _union_lists([m.get("research_focus", {}).get("cell_gene_sources", []) for m in members]),
             "constructs_bioengineering": _union_lists([m.get("research_focus", {}).get("constructs_bioengineering", []) for m in members]),
@@ -282,7 +293,9 @@ def main():
         json.dump(merged, f, indent=2)
 
     multi_source = sum(1 for lab in merged if lab["source_record_count"] > 1)
+    geocoded = sum(1 for lab in merged if lab.get("geo_coordinates"))
     print(f"  -> {multi_source} labs were confirmed by more than one source record")
+    print(f"  -> {geocoded} labs carry geo_coordinates from step 6's geocoding")
     print(f"\nDone. Wrote {len(merged)} deduplicated lab profiles to {out_path}")
 
 
