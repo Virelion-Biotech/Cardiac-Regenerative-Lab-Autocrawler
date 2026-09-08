@@ -15,9 +15,11 @@ experimental model systems from free text — and, for crawled lab pages
 (unstructured HTML text with no pre-parsed fields), extracting identity and
 affiliation fields too.
 
-Note: geographic coordinates are left null in this step. Geocoding city/
-country into lat/long requires a separate geocoding API (e.g. Nominatim)
-not yet wired up — a reasonable fast-follow addition to this script.
+Geocoding (fast-follow, now wired up): once city/country are known (either
+pre-parsed or Claude-extracted), each candidate is geocoded via Nominatim
+into geo_coordinates. Geocoding is cached per (city, country) pair within a
+run and rate-limited to Nominatim's usage-policy ceiling of 1 request/sec,
+since many candidates share the same institution's city.
 
 Output: data/<year>/labs_extracted.json
     A list of lab profile candidates (not yet deduplicated — that's step 7).
@@ -31,6 +33,7 @@ import time
 from typing import Any
 
 import anthropic
+import requests
 
 import config
 
@@ -194,6 +197,60 @@ def _text_for_record(rec: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Geocoding (Nominatim)
+# ---------------------------------------------------------------------------
+
+# Cache of (normalized city, normalized country) -> {"lat": float, "lng": float} | None,
+# scoped to a single run. Many candidates share the same institution's city, so this
+# avoids redundant geocoding calls (and keeps us comfortably under Nominatim's 1 req/sec cap).
+_geocode_cache: dict[tuple[str, str], dict[str, float] | None] = {}
+_last_geocode_request_time = 0.0
+
+
+def _geocode_rate_limit():
+    global _last_geocode_request_time
+    elapsed = time.time() - _last_geocode_request_time
+    wait = config.GEOCODE_DELAY_SECONDS - elapsed
+    if wait > 0:
+        time.sleep(wait)
+    _last_geocode_request_time = time.time()
+
+
+def geocode_city_country(city: str, country: str) -> dict[str, float] | None:
+    """
+    Looks up (city, country) via Nominatim and returns {"lat": ..., "lng": ...},
+    or None if either field is empty, the lookup returns no results, or the
+    request fails. Failures are logged but never raise — geocoding is a
+    nice-to-have enrichment, not a blocker for the rest of the pipeline.
+    """
+    city, country = (city or "").strip(), (country or "").strip()
+    if not city and not country:
+        return None
+
+    key = (city.lower(), country.lower())
+    if key in _geocode_cache:
+        return _geocode_cache[key]
+
+    query = ", ".join(part for part in (city, country) if part)
+    params = {"q": query, "format": "json", "limit": 1}
+    headers = {"User-Agent": config.GEOCODE_USER_AGENT}
+
+    result = None
+    try:
+        _geocode_rate_limit()
+        resp = requests.get(config.NOMINATIM_BASE, params=params, headers=headers, timeout=15)
+        resp.raise_for_status()
+        matches = resp.json()
+        if matches:
+            result = {"lat": float(matches[0]["lat"]), "lng": float(matches[0]["lon"])}
+    except (requests.RequestException, ValueError, KeyError, IndexError) as e:
+        print(f"    [warn] geocoding failed for '{query}': {e}")
+
+    _geocode_cache[key] = result
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Claude extraction
 # ---------------------------------------------------------------------------
 
@@ -263,12 +320,12 @@ def extract_batch_sync(client: anthropic.Anthropic, batch: list[dict[str, Any]])
 
 
 def submit_batch_job(client: anthropic.Anthropic, batches: list[list[dict[str, Any]]]) -> tuple[str, dict[str, list[dict[str, Any]]]]:
-    requests = []
+    requests_ = []
     custom_id_map = {}
     for i, batch in enumerate(batches):
         custom_id = f"batch_{i}"
         custom_id_map[custom_id] = batch
-        requests.append({
+        requests_.append({
             "custom_id": custom_id,
             "params": {
                 "model": config.CLAUDE_MODEL,
@@ -277,7 +334,7 @@ def submit_batch_job(client: anthropic.Anthropic, batches: list[list[dict[str, A
                 "messages": [{"role": "user", "content": build_items_block(batch)}],
             },
         })
-    batch_job = client.messages.batches.create(requests=requests)
+    batch_job = client.messages.batches.create(requests=requests_)
     return batch_job.id, custom_id_map
 
 
@@ -363,8 +420,12 @@ def main():
 
     all_extractions = extract_all(candidates)
 
+    print("Geocoding city/country pairs via Nominatim (rate-limited to "
+          f"{1 / config.GEOCODE_DELAY_SECONDS:.0f} req/sec)...")
+
     labs_extracted = []
     needs_review = []
+    geocoded_count = 0
 
     for c in candidates:
         extraction = all_extractions.get(c["id"])
@@ -373,6 +434,10 @@ def main():
         if extraction is None or extraction.get("_extraction_failed"):
             needs_review.append(original)
             continue
+
+        geo_coordinates = geocode_city_country(extraction.get("city", ""), extraction.get("country", ""))
+        if geo_coordinates is not None:
+            geocoded_count += 1
 
         labs_extracted.append({
             "pi_full_name": extraction.get("pi_full_name", ""),
@@ -384,7 +449,7 @@ def main():
             "institution": extraction.get("institution", ""),
             "city": extraction.get("city", ""),
             "country": extraction.get("country", ""),
-            "geo_coordinates": None,  # TODO fast-follow: geocode city/country
+            "geo_coordinates": geo_coordinates,
             "research_focus": {
                 "cell_gene_sources": extraction.get("cell_gene_sources", []),
                 "constructs_bioengineering": extraction.get("constructs_bioengineering", []),
@@ -425,6 +490,8 @@ def main():
             json.dump(needs_review, f, indent=2)
         print(f"\n[!] {len(needs_review)} items failed extraction and were written to {review_path}")
 
+    print(f"  Geocoded {geocoded_count}/{len(labs_extracted)} candidates "
+          f"({len(_geocode_cache)} distinct city/country pairs looked up)")
     print(f"\nDone. Extracted {len(labs_extracted)} lab profile candidates to {out_path}")
 
 
