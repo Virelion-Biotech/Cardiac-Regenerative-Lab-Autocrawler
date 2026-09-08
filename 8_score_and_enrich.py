@@ -14,11 +14,15 @@ Scores and enriches each deduplicated lab profile from step 7:
   through here unchanged.
 - Electromechanical Risk Profile Tagging: flags labs whose research_focus
   includes electromechanical integration or arrhythmia mitigation vectors.
-
-NOT computed in this step (left as explicit null/None with a note, rather
-than faked): citation impact (would require Semantic Scholar citation counts,
-not harvested in step 1) and industry/startup spinoff affiliation (no data
-source for this in v1). Both are reasonable fast-follow additions.
+- Citation impact (fast-follow, now wired up): batch-looked-up via the
+  Semantic Scholar Graph API, keyed off each lab's latest_pub_doi.
+- Industry/startup spinoff affiliation (fast-follow, now wired up): no
+  dedicated spinoff-affiliation data source exists, so this uses a heuristic
+  proxy — cross-referencing each lab's patent_ids (from step 10) against
+  raw_patents.json's assignee organizations, and flagging labs whose patents
+  are assigned to a non-academic-looking organization distinct from their
+  own institution. This is a proxy signal for a human reviewer, not a
+  verified affiliation, and is labeled as such in the output.
 
 Output: data/<year>/labs_final.json
 
@@ -27,8 +31,11 @@ Usage:
 """
 
 import json
+import time
 from datetime import datetime
 from typing import Any
+
+import requests
 
 import config
 
@@ -98,6 +105,105 @@ def compute_risk_flags(lab: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Citation impact (Semantic Scholar)
+# ---------------------------------------------------------------------------
+
+def fetch_citation_counts(dois: list[str]) -> dict[str, int]:
+    """
+    Batch-looks-up citationCount for a list of DOIs via Semantic Scholar's
+    /paper/batch endpoint. Runs in chunks of config.SEMANTIC_SCHOLAR_BATCH_SIZE
+    (S2's documented batch limit), politely rate-limited between chunks.
+    Missing/unrecognized DOIs are simply absent from the returned dict rather
+    than raising — S2's coverage isn't exhaustive, especially for very recent
+    papers or non-journal sources.
+    """
+    counts: dict[str, int] = {}
+    if not dois:
+        return counts
+
+    headers = {"Content-Type": "application/json"}
+    if config.SEMANTIC_SCHOLAR_API_KEY:
+        headers["x-api-key"] = config.SEMANTIC_SCHOLAR_API_KEY
+
+    url = f"{config.SEMANTIC_SCHOLAR_BASE}/paper/batch"
+    params = {"fields": "externalIds,citationCount"}
+
+    for i in range(0, len(dois), config.SEMANTIC_SCHOLAR_BATCH_SIZE):
+        chunk = dois[i:i + config.SEMANTIC_SCHOLAR_BATCH_SIZE]
+        ids = [f"DOI:{doi}" for doi in chunk]
+        try:
+            resp = requests.post(url, params=params, headers=headers, json={"ids": ids}, timeout=30)
+            resp.raise_for_status()
+            results = resp.json()
+            for doi, entry in zip(chunk, results):
+                if entry and entry.get("citationCount") is not None:
+                    counts[doi] = entry["citationCount"]
+        except requests.RequestException as e:
+            print(f"    [warn] Semantic Scholar batch lookup failed for a chunk of {len(chunk)} DOIs: {e}")
+
+        time.sleep(config.SEMANTIC_SCHOLAR_DELAY_SECONDS)
+
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# Industry / startup spinoff affiliation heuristic
+# ---------------------------------------------------------------------------
+
+def _load_raw_patents() -> dict[str, dict[str, Any]]:
+    """Loads raw_patents.json (step 10's output) into a {patent_id: record} lookup."""
+    path = config.run_path("raw_patents")
+    if not path.exists():
+        return {}
+    with open(path) as f:
+        patents = json.load(f)
+    return {p.get("patent_id", ""): p for p in patents if p.get("patent_id")}
+
+
+def _looks_academic(org: str) -> bool:
+    org_lower = org.lower()
+    return any(keyword in org_lower for keyword in config.SPINOFF_ACADEMIC_ORG_KEYWORDS)
+
+
+def _orgs_distinct(assignee_org: str, lab_institution: str) -> bool:
+    """True if the assignee org doesn't look like the same entity as the lab's
+    institution — cheap token-overlap check, not full institution matching
+    (avoiding a cross-module import for a heuristic this approximate)."""
+    a = set(assignee_org.lower().split())
+    b = set(lab_institution.lower().split())
+    if not a or not b:
+        return True
+    return not (a & b)
+
+
+def compute_industry_spinoff_flag(lab: dict[str, Any], patents_by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    patent_ids = lab.get("metrics", {}).get("patent_ids", [])
+    if not patent_ids:
+        return {
+            "flag": None,
+            "matched_organizations": [],
+            "note": "No associated patents to evaluate — not computed rather than assumed false.",
+        }
+
+    lab_institution = lab.get("institution", "")
+    matched_orgs = set()
+
+    for patent_id in patent_ids:
+        patent = patents_by_id.get(patent_id)
+        if not patent:
+            continue
+        for org in patent.get("assignee_organizations", []) or []:
+            if org and not _looks_academic(org) and _orgs_distinct(org, lab_institution):
+                matched_orgs.add(org)
+
+    return {
+        "flag": bool(matched_orgs),
+        "matched_organizations": sorted(matched_orgs),
+        "note": "Heuristic proxy based on patent assignee organizations, not a verified spinoff/affiliation database.",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -114,13 +220,32 @@ def main():
 
     print(f"Scoring and enriching {len(labs)} deduplicated lab profiles...")
 
+    all_dois = sorted({
+        lab.get("digital_footprint", {}).get("latest_pub_doi", "")
+        for lab in labs
+        if lab.get("digital_footprint", {}).get("latest_pub_doi")
+    })
+    print(f"  Looking up citation counts for {len(all_dois)} distinct DOIs via Semantic Scholar...")
+    citation_counts = fetch_citation_counts(all_dois)
+    print(f"  -> found citation counts for {len(citation_counts)}/{len(all_dois)} DOIs")
+
+    patents_by_id = _load_raw_patents()
+
     final = []
     status_counts: dict[str, int] = {}
+    spinoff_flagged = 0
 
     for lab in labs:
         avi = compute_avi(lab)
         risk = compute_risk_flags(lab)
         status_counts[avi["status"]] = status_counts.get(avi["status"], 0) + 1
+
+        doi = lab.get("digital_footprint", {}).get("latest_pub_doi", "")
+        citation_impact = citation_counts.get(doi) if doi else None
+
+        spinoff = compute_industry_spinoff_flag(lab, patents_by_id)
+        if spinoff["flag"]:
+            spinoff_flagged += 1
 
         enriched = {
             **lab,
@@ -128,8 +253,11 @@ def main():
             "risk_flags": risk,
             "translation_scale_metrics": {
                 "grant_funding_usd": lab.get("metrics", {}).get("grant_funding_usd"),
-                "citation_impact": None,  # TODO fast-follow: Semantic Scholar citation counts
-                "industry_spinoff_affiliation": None,  # TODO fast-follow: no data source in v1
+                "citation_impact": citation_impact,
+                "citation_impact_note": "" if doi else "No DOI available for citation lookup.",
+                "industry_spinoff_affiliation": spinoff["flag"],
+                "industry_spinoff_matched_organizations": spinoff["matched_organizations"],
+                "industry_spinoff_note": spinoff["note"],
             },
         }
         final.append(enriched)
@@ -148,6 +276,7 @@ def main():
 
     risk_count = sum(1 for lab in final if lab["risk_flags"]["electromechanical_risk_profile"])
     print(f"  {risk_count} labs flagged with an electromechanical risk profile")
+    print(f"  {spinoff_flagged} labs flagged with a possible industry/startup spinoff affiliation (heuristic)")
 
     print(f"\nDone. Wrote {len(final)} scored/enriched lab profiles to {out_path}")
 
