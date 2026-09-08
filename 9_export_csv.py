@@ -4,13 +4,30 @@ Virelion Biotech
 
 Final step: flattens labs_final.json into a spreadsheet-friendly CSV, and —
 if a prior year's run exists on disk — generates a human-readable
-year-over-year diff summary (new labs, funding shifts, newly inactive labs).
+year-over-year diff summary (new labs, funding shifts, newly inactive labs,
+institutional migrations).
 
 Diffing reuses the same PI/institution matching logic as step 7's entity
 resolution (ORCID/email exact match, or name+institution fuzzy match), so a
 lab is recognized as "the same lab" across years using the same rules that
 deduplicated it within a single year. That module is dynamically imported
 since its filename starts with a digit and isn't a valid `import` target.
+
+Migration matching (fast-follow, now more robust): the original version only
+matched cross-year records when either ORCID/email was present, or
+institution matched — which meant a PI who moved to a genuinely different
+institution with no shared identifying token, and who has no ORCID/email on
+file (the common case, per step 7's comments), was invisible as a migration
+and silently showed up as a "new lab" instead. Two independent,
+institution-agnostic identity anchors are now added ahead of the
+name+institution fallback: an exact Google Scholar profile URL match, and an
+exact lab/personal homepage URL match — both are stable across an
+institutional move in a way "institution" itself isn't, and both are already
+harvested into digital_footprint by steps 6/7. This still isn't a complete
+fix (a PI with no ORCID, no Scholar profile, and no captured lab URL who
+also changes their name's matching pattern is still missed), but it
+meaningfully narrows the gap described above without requiring new data
+collection.
 
 Output:
     data/<year>/labs_report.csv
@@ -50,7 +67,8 @@ CSV_COLUMNS = [
     "contact", "translational_stage", "cell_gene_sources", "constructs_bioengineering",
     "functional_vectors", "experimental_models", "grant_funding_usd",
     "clinical_trial_ids", "patent_ids", "avi_status", "avi_score", "most_recent_activity_year",
-    "electromechanical_risk_profile", "member_count", "source_record_types",
+    "electromechanical_risk_profile", "citation_impact", "industry_spinoff_affiliation",
+    "member_count", "source_record_types",
 ]
 
 
@@ -64,6 +82,7 @@ def flatten_lab(lab: dict[str, Any]) -> dict[str, str]:
     metrics = lab.get("metrics", {})
     avi = lab.get("activity_verification_index", {})
     risk = lab.get("risk_flags", {})
+    scale = lab.get("translation_scale_metrics", {})
 
     return {
         "pi_full_name": lab.get("pi_full_name", ""),
@@ -90,6 +109,10 @@ def flatten_lab(lab: dict[str, Any]) -> dict[str, str]:
         "avi_score": avi.get("avi_score", "") if avi.get("avi_score") is not None else "",
         "most_recent_activity_year": avi.get("most_recent_activity_year", "") or "",
         "electromechanical_risk_profile": "Yes" if risk.get("electromechanical_risk_profile") else "No",
+        "citation_impact": scale.get("citation_impact", "") if scale.get("citation_impact") is not None else "",
+        "industry_spinoff_affiliation": "Yes" if scale.get("industry_spinoff_affiliation") else (
+            "" if scale.get("industry_spinoff_affiliation") is None else "No"
+        ),
         "member_count": lab.get("member_count", ""),
         "source_record_types": _join(lab.get("source_record_types", [])),
     }
@@ -108,6 +131,20 @@ def export_csv(labs: list[dict[str, Any]], out_path: Path):
 # ---------------------------------------------------------------------------
 
 def _labs_match(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """
+    Identity check across two annual runs, in priority order of how stable
+    each signal is across an institutional move:
+      1. ORCID (rarely populated currently, but the strongest signal when present)
+      2. Email
+      3. Google Scholar profile URL (institution-agnostic — persists across a move)
+      4. Lab/personal homepage URL (usually institution-agnostic in practice,
+         though a PI who takes their old URL's exact path with them to a new
+         host would still match; a URL that's reissued to someone else at the
+         old institution is the main failure mode, and is rare in practice)
+      5. Name + institution fuzzy match (the original v1 fallback — the only
+         path that requires institution to stay the same, which is exactly
+         the case a genuine migration violates)
+    """
     orcid_a, orcid_b = a.get("orcid", ""), b.get("orcid", "")
     if orcid_a and orcid_b and orcid_a == orcid_b:
         return True
@@ -116,10 +153,45 @@ def _labs_match(a: dict[str, Any], b: dict[str, Any]) -> bool:
     if email_a and email_b and email_a == email_b:
         return True
 
+    scholar_a = a.get("digital_footprint", {}).get("google_scholar", "").strip().lower()
+    scholar_b = b.get("digital_footprint", {}).get("google_scholar", "").strip().lower()
+    if scholar_a and scholar_b and scholar_a == scholar_b:
+        return True
+
+    lab_url_a = a.get("digital_footprint", {}).get("lab_url", "").strip().lower()
+    lab_url_b = b.get("digital_footprint", {}).get("lab_url", "").strip().lower()
+    if lab_url_a and lab_url_b and lab_url_a == lab_url_b:
+        return True
+
     return (
         resolve_entities.names_match(a.get("pi_full_name", ""), b.get("pi_full_name", ""))
         and resolve_entities.institutions_match(a.get("institution", ""), b.get("institution", ""))
     )
+
+
+def _matched_via_institution_agnostic_signal(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """
+    True if two records matched via a signal that doesn't require the
+    institution to stay the same (ORCID/email/Scholar/lab URL) — used to
+    decide whether an institution change for this pair is real migration
+    evidence, versus just two coincidentally-matched name+institution
+    records where "migration" wouldn't even make sense to check.
+    """
+    orcid_a, orcid_b = a.get("orcid", ""), b.get("orcid", "")
+    if orcid_a and orcid_b and orcid_a == orcid_b:
+        return True
+    email_a, email_b = a.get("email", "").strip().lower(), b.get("email", "").strip().lower()
+    if email_a and email_b and email_a == email_b:
+        return True
+    scholar_a = a.get("digital_footprint", {}).get("google_scholar", "").strip().lower()
+    scholar_b = b.get("digital_footprint", {}).get("google_scholar", "").strip().lower()
+    if scholar_a and scholar_b and scholar_a == scholar_b:
+        return True
+    lab_url_a = a.get("digital_footprint", {}).get("lab_url", "").strip().lower()
+    lab_url_b = b.get("digital_footprint", {}).get("lab_url", "").strip().lower()
+    if lab_url_a and lab_url_b and lab_url_a == lab_url_b:
+        return True
+    return False
 
 
 def match_against_prior(current_labs: list[dict], prior_labs: list[dict]) -> list[tuple[dict, dict | None]]:
@@ -170,7 +242,11 @@ def build_diff_summary(current_labs: list[dict], prior_labs: list[dict], prior_y
         prior_inst = prior.get("institution", "")
         if cur_inst and prior_inst and cur_inst != prior_inst and \
            not resolve_entities.institutions_match(cur_inst, prior_inst):
-            migrations.append((cur, prior_inst, cur_inst))
+            # Only counted as migration evidence if the pair was matched via an
+            # institution-agnostic signal — otherwise the pair wouldn't have
+            # matched at all under a genuine institution change (see _labs_match).
+            confidence = "high" if _matched_via_institution_agnostic_signal(cur, prior) else "name-match only"
+            migrations.append((cur, prior_inst, cur_inst, confidence))
 
     lines = [
         f"# Annual Diff Summary — {config.CURRENT_YEAR} vs. {prior_year_label}",
@@ -207,12 +283,20 @@ def build_diff_summary(current_labs: list[dict], prior_labs: list[dict], prior_y
 
     lines += ["", f"## 🏛️ Possible Institutional Migrations ({len(migrations)})", ""]
     if migrations:
-        for lab, prev_inst, cur_inst in migrations:
-            lines.append(f"- **{lab.get('pi_full_name', 'Unknown')}**: {prev_inst} → {cur_inst}")
+        for lab, prev_inst, cur_inst, confidence in migrations:
+            lines.append(f"- **{lab.get('pi_full_name', 'Unknown')}**: {prev_inst} → {cur_inst} _(confidence: {confidence})_")
     else:
         lines.append("_None detected._")
-
     lines.append("")
+    lines.append(
+        "_Migrations are only detectable for PIs matched across years via ORCID, email, a Google Scholar "
+        "profile URL, or a captured lab URL — 'name-match only' entries above matched on institution too, "
+        "which shouldn't happen for a genuine institution change and likely indicates a coincidental "
+        "name+institution collision rather than a real move. A PI with none of those stable identifiers on "
+        "file who also moves institutions will still show up as a new lab instead — see README for the "
+        "underlying data gap (no reliable identifier is harvested for every source in v1)._"
+    )
+
     return "\n".join(lines)
 
 
