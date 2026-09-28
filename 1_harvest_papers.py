@@ -73,9 +73,10 @@ def pubmed_fetch_details(pmids: list[str]) -> list[dict[str, Any]]:
 
 def _parse_pubmed_article(article: ET.Element) -> dict[str, Any]:
     pmid = article.findtext(".//PMID", default="")
-    title = article.findtext(".//ArticleTitle", default="")
+    title_node = article.find(".//ArticleTitle")
+    title = "".join(title_node.itertext()) if title_node is not None else ""
 
-    abstract_parts = [el.text or "" for el in article.findall(".//AbstractText")]
+    abstract_parts = ["".join(el.itertext()) for el in article.findall(".//AbstractText")]
     abstract = " ".join(abstract_parts).strip()
 
     journal = article.findtext(".//Journal/Title", default="")
