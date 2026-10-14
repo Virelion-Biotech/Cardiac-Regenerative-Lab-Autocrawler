@@ -8,6 +8,21 @@ Run once a year, by hand. No scheduler, no orchestration framework, no self-heal
 
 ---
 
+
+<!-- VALIDATION_PRODUCT_STATUS:BEGIN -->
+## Validation and product completion status
+
+**Reviewed 2026-10-14; implementation base `152845594950`.** **Status: Discovery pipeline; exhaustive lab coverage unestablished.** This is an evidence-backed scope assessment, not a percentage-complete estimate or a declaration that the product is finished.
+
+| Area | Current evidence / remaining gate |
+|---|---|
+| Software / operational checks | Automated test sources and CI definitions are present; this documentation audit does not report a new algorithm/data-validation run. |
+| Scientific or domain evidence | A staged source/LLM-assisted lab discovery pipeline is present. No reviewed global gold-standard census or numeric recall artifact was identified in this documentation audit; exhaustive coverage must not be assumed. |
+| Remaining for the declared product scope | Build a reviewed lab/PI gold set and measure precision/recall, identity merges and activity classification; qualify source access/pagination and failed-extraction review; verify affiliations/funding/trials from dated primary evidence; complete reproducible annual change review and export QA. |
+
+Evidence and limits: [repository report](README.md). The [organization status index](https://github.com/Virelion-Biotech/Virelion-HeartTwin/blob/main/docs/STACK_VALIDATION_STATUS.md) separates software, numerical, data-readiness and empirical qualification. Code/schema execution or a completed download is not a substitute for endpoint-specific validation.
+<!-- VALIDATION_PRODUCT_STATUS:END -->
+
 ## 📐 Architecture & Pipeline Overview
 
 The engine operates as a sequential modular pipeline with data stored and versioned by run year (`data/YYYY/`).
